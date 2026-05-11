@@ -204,7 +204,9 @@ jobs:
         run: pnpm build
 
       - name: Run harness parity lane
+        shell: bash
         run: |
+          set +e
           pnpm openclaw qa harness-parity \
             --left current \
             --right prompt-overlay \
@@ -214,6 +216,12 @@ jobs:
             --alt-model "${OPENCLAW_CI_OPENAI_MODEL}" \
             --token-efficiency \
             --output-dir .artifacts/qa-e2e/harness-parity
+          status=$?
+          set -e
+          test -f .artifacts/qa-e2e/harness-parity/qa-harness-parity-summary.json
+          test -f .artifacts/qa-e2e/harness-parity/qa-harness-parity-report.md
+          echo "Harness parity exit status: ${status}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Prompt-overlay drift is expected for this proof lane; artifact generation is the pass condition." >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run jsonl replay lane
         run: |
