@@ -1,0 +1,287 @@
+name: Runtime Parity Proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "OpenClaw ref/SHA to prove"
+        required: true
+        type: string
+      expected_sha:
+        description: "Full SHA target_ref must resolve to"
+        required: true
+        type: string
+      run_soak:
+        description: "Run optional soak-100 lane"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  NODE_VERSION: "24.15.0"
+  PNPM_VERSION: "11.0.8"
+  OPENCLAW_BUILD_PRIVATE_QA: "1"
+  OPENCLAW_ENABLE_PRIVATE_QA_CLI: "1"
+  OPENCLAW_QA_TRANSPORT_READY_TIMEOUT_MS: "180000"
+  OPENCLAW_CI_OPENAI_MODEL: "openai/gpt-5.5"
+
+jobs:
+  static-and-unit-proof:
+    name: Static and unit proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 1
+
+      - name: Verify selected SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [[ "${actual}" != "${{ inputs.expected_sha }}" ]]; then
+            echo "target_ref resolved to ${actual}, expected ${{ inputs.expected_sha }}" >&2
+            exit 1
+          fi
+
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          pnpm-version: ${{ env.PNPM_VERSION }}
+          install-bun: "true"
+
+      - name: Typecheck test surface
+        run: pnpm check:test-types
+
+      - name: Lint repo
+        run: pnpm lint --threads=8
+
+      - name: Run targeted runtime parity tests
+        run: |
+          pnpm test \
+            extensions/qa-lab/src/providers/mock-openai/server.test.ts \
+            extensions/qa-lab/src/runtime-tool-fixture.test.ts \
+            extensions/qa-lab/src/runtime-parity.test.ts \
+            extensions/qa-lab/src/runtime-suite.test.ts \
+            extensions/qa-lab/src/suite.test.ts \
+            extensions/qa-lab/src/cli.runtime.test.ts \
+            extensions/qa-lab/src/tool-coverage-report.test.ts \
+            extensions/qa-lab/src/token-efficiency-report.test.ts \
+            extensions/qa-lab/src/harness-parity.test.ts \
+            extensions/qa-lab/src/jsonl-replay.test.ts \
+            extensions/qa-lab/src/codex-plugin-lifecycle.test.ts \
+            extensions/qa-lab/src/scenario-catalog.test.ts \
+            extensions/codex/src/app-server/dynamic-tools.test.ts
+
+  runtime-mock-proof:
+    name: Runtime mock harness proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 1
+
+      - name: Verify selected SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [[ "${actual}" != "${{ inputs.expected_sha }}" ]]; then
+            echo "target_ref resolved to ${actual}, expected ${{ inputs.expected_sha }}" >&2
+            exit 1
+          fi
+
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          pnpm-version: ${{ env.PNPM_VERSION }}
+          install-bun: "true"
+
+      - name: Build private QA runtime
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: pnpm build
+
+      - name: Run tool-defaults direct lane
+        run: |
+          pnpm openclaw qa suite \
+            --provider-mode mock-openai \
+            --runtime-suite tool-defaults \
+            --codex-tool-loading direct \
+            --concurrency 1 \
+            --model "${OPENCLAW_CI_OPENAI_MODEL}" \
+            --alt-model "${OPENCLAW_CI_OPENAI_MODEL}" \
+            --runtime-pair pi,codex \
+            --output-dir .artifacts/qa-e2e/tool-defaults-direct
+
+      - name: Run tool-defaults searchable lane
+        run: |
+          pnpm openclaw qa suite \
+            --provider-mode mock-openai \
+            --runtime-suite tool-defaults \
+            --codex-tool-loading searchable \
+            --allow-failures \
+            --concurrency 1 \
+            --model "${OPENCLAW_CI_OPENAI_MODEL}" \
+            --alt-model "${OPENCLAW_CI_OPENAI_MODEL}" \
+            --runtime-pair pi,codex \
+            --output-dir .artifacts/qa-e2e/tool-defaults-searchable
+
+      - name: Run first-hour-20 direct lane
+        run: |
+          pnpm openclaw qa suite \
+            --provider-mode mock-openai \
+            --runtime-suite first-hour-20 \
+            --codex-tool-loading direct \
+            --concurrency 1 \
+            --model "${OPENCLAW_CI_OPENAI_MODEL}" \
+            --alt-model "${OPENCLAW_CI_OPENAI_MODEL}" \
+            --runtime-pair pi,codex \
+            --output-dir .artifacts/qa-e2e/first-hour-20-direct
+
+      - name: Generate token efficiency report
+        if: always()
+        run: |
+          pnpm openclaw qa parity-report \
+            --repo-root . \
+            --runtime-axis \
+            --token-efficiency \
+            --summary .artifacts/qa-e2e/first-hour-20-direct/qa-suite-summary.json \
+            --output-dir .artifacts/qa-e2e/first-hour-20-direct/report
+
+      - name: Upload runtime mock proof artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-mock-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/qa-e2e/
+          retention-days: 14
+          if-no-files-found: error
+
+  extra-harness-proof:
+    name: Harness parity and replay proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 1
+
+      - name: Verify selected SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [[ "${actual}" != "${{ inputs.expected_sha }}" ]]; then
+            echo "target_ref resolved to ${actual}, expected ${{ inputs.expected_sha }}" >&2
+            exit 1
+          fi
+
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          pnpm-version: ${{ env.PNPM_VERSION }}
+          install-bun: "true"
+
+      - name: Build private QA runtime
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: pnpm build
+
+      - name: Run harness parity lane
+        run: |
+          pnpm openclaw qa harness-parity \
+            --left current \
+            --right prompt-overlay \
+            --runtime-suite first-hour \
+            --provider-mode mock-openai \
+            --model "${OPENCLAW_CI_OPENAI_MODEL}" \
+            --alt-model "${OPENCLAW_CI_OPENAI_MODEL}" \
+            --token-efficiency \
+            --output-dir .artifacts/qa-e2e/harness-parity
+
+      - name: Run jsonl replay lane
+        run: |
+          pnpm openclaw qa jsonl-replay \
+            --runtime-pair pi,codex \
+            --provider-mode mock-openai \
+            --output-dir .artifacts/qa-e2e/jsonl-replay
+
+      - name: Upload extra proof artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extra-harness-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/qa-e2e/
+          retention-days: 14
+          if-no-files-found: error
+
+  soak-proof:
+    name: Optional soak-100 proof
+    if: ${{ inputs.run_soak }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 1
+
+      - name: Verify selected SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          if [[ "${actual}" != "${{ inputs.expected_sha }}" ]]; then
+            echo "target_ref resolved to ${actual}, expected ${{ inputs.expected_sha }}" >&2
+            exit 1
+          fi
+
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          pnpm-version: ${{ env.PNPM_VERSION }}
+          install-bun: "true"
+
+      - name: Build private QA runtime
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: pnpm build
+
+      - name: Run soak-100 lane
+        run: |
+          pnpm openclaw qa suite \
+            --provider-mode mock-openai \
+            --runtime-suite soak-100 \
+            --codex-tool-loading direct \
+            --concurrency 1 \
+            --model "${OPENCLAW_CI_OPENAI_MODEL}" \
+            --alt-model "${OPENCLAW_CI_OPENAI_MODEL}" \
+            --runtime-pair pi,codex \
+            --output-dir .artifacts/qa-e2e/soak-100
+
+      - name: Upload soak proof artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/qa-e2e/
+          retention-days: 14
+          if-no-files-found: error
