@@ -153,13 +153,59 @@ jobs:
 
       - name: Generate token efficiency report
         if: always()
+        shell: bash
         run: |
+          set +e
           pnpm openclaw qa parity-report \
             --repo-root . \
             --runtime-axis \
             --token-efficiency \
             --summary .artifacts/qa-e2e/first-hour-20-direct/qa-suite-summary.json \
             --output-dir .artifacts/qa-e2e/first-hour-20-direct/report
+          status=$?
+          set -e
+          test -f .artifacts/qa-e2e/first-hour-20-direct/report/qa-runtime-parity-summary.json
+          test -f .artifacts/qa-e2e/first-hour-20-direct/report/qa-runtime-token-efficiency-summary.json
+          echo "Runtime parity report exit status: ${status}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Known native-live-required report-only rows may make the parity report verdict fail; artifact validation below is the pass condition." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate runtime proof summaries
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const read = (path) => JSON.parse(fs.readFileSync(path, "utf8"));
+          const assert = (condition, message) => {
+            if (!condition) {
+              throw new Error(message);
+            }
+          };
+
+          const toolDefaultsDirect = read(".artifacts/qa-e2e/tool-defaults-direct/qa-suite-summary.json");
+          const toolDefaultsSearchable = read(".artifacts/qa-e2e/tool-defaults-searchable/qa-suite-summary.json");
+          const firstHour20 = read(".artifacts/qa-e2e/first-hour-20-direct/qa-suite-summary.json");
+          assert(toolDefaultsDirect.counts.failed === 0, "tool-defaults direct must have zero failed rows");
+          assert(toolDefaultsDirect.counts.passed === 20, "tool-defaults direct must pass all 20 rows");
+          assert(toolDefaultsSearchable.counts.failed === 0, "tool-defaults searchable must have zero hard failed rows");
+          assert(firstHour20.counts.failed === 0, "first-hour-20 direct must have zero hard failed rows");
+          assert(firstHour20.counts.passed === 15, "first-hour-20 direct expected 15 passing rows");
+
+          const runtimeReport = read(".artifacts/qa-e2e/first-hour-20-direct/report/qa-runtime-parity-summary.json");
+          const expectedReportOnly = [
+            "Instruction followthrough repo contract",
+            "Approval turn tool followthrough",
+            "Compaction retry after mutating tool",
+          ];
+          const failures = runtimeReport.failures ?? [];
+          assert(failures.length === expectedReportOnly.length, `expected ${expectedReportOnly.length} report-only parity failures, got ${failures.length}`);
+          for (const expected of expectedReportOnly) {
+            assert(failures.some((failure) => failure.includes(expected)), `missing expected report-only row: ${expected}`);
+          }
+
+          const tokenSummary = read(".artifacts/qa-e2e/first-hour-20-direct/report/qa-runtime-token-efficiency-summary.json");
+          assert(tokenSummary.status === "estimated", "mock token efficiency summary must be estimated");
+          assert((tokenSummary.rows ?? []).length === 18, "token efficiency summary must include 18 rows");
+          assert((tokenSummary.rows ?? []).every((row) => row.usageSource === "mock-estimate"), "all token rows must be mock-estimate");
+          NODE
 
       - name: Upload runtime mock proof artifacts
         if: always()
