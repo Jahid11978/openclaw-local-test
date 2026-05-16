@@ -1,5 +1,6 @@
-import { readFileSync, readdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import fs, { readFileSync } from "node:fs";
+import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   BaseProbeResult as ContractBaseProbeResult,
@@ -22,7 +23,7 @@ import type {
 } from "openclaw/plugin-sdk/core";
 import * as providerEntrySdk from "openclaw/plugin-sdk/provider-entry";
 import ts from "typescript";
-import { describe, expect, expectTypeOf, it } from "vitest";
+import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import type { ChannelMessageActionContext } from "../../channels/plugins/types.js";
 import type {
   BaseProbeResult,
@@ -46,10 +47,9 @@ import type {
 } from "../../plugin-sdk/channel-plugin-common.js";
 import * as channelReplyPipelineDirectSdk from "../../plugin-sdk/channel-reply-pipeline.js";
 import * as coreDirectSdk from "../../plugin-sdk/core.js";
-import { pluginSdkSubpaths } from "../../plugin-sdk/entrypoints.js";
+import { publicPluginSdkSubpaths as pluginSdkSubpaths } from "../../plugin-sdk/entrypoints.js";
 import * as globalSingletonDirectSdk from "../../plugin-sdk/global-singleton.js";
 import * as providerEntryDirectSdk from "../../plugin-sdk/provider-entry.js";
-import * as textRuntimeDirectSdk from "../../plugin-sdk/text-runtime.js";
 import type { PluginRuntime } from "../runtime/types.js";
 import type { OpenClawPluginApi } from "../types.js";
 
@@ -326,12 +326,44 @@ function expectNamedExportParity(params: BrowserHelperExportParityContract) {
   ]);
 }
 
+function listTrackedRepoTsFiles(dir: string): string[] | null {
+  const relativeDir = relative(REPO_ROOT, dir).split(/[\\/]+/u).join("/");
+  if (!relativeDir || relativeDir.startsWith("..")) {
+    return null;
+  }
+  const result = spawnSync("git", ["ls-files", "--", relativeDir], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (result.status !== 0) {
+    return null;
+  }
+  return result.stdout
+    .split("\n")
+    .map((line) => line.trim().replaceAll("\\", "/"))
+    .filter(
+      (line) =>
+        line.endsWith(".ts") &&
+        !line.includes("/dist/") &&
+        !line.includes("/node_modules/"),
+    )
+    .map((line) => resolve(REPO_ROOT, ...line.split("/")))
+    .toSorted();
+}
+
 function listRepoTsFiles(dir: string): string[] {
   const cached = repoTsFilesCache.get(dir);
-  if (cached) {
+  if (cached !== undefined) {
     return cached;
   }
-  const entries = readdirSync(dir, { withFileTypes: true });
+  const trackedFiles = listTrackedRepoTsFiles(dir);
+  if (trackedFiles) {
+    repoTsFilesCache.set(dir, trackedFiles);
+    return trackedFiles;
+  }
+
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
   const files = entries.flatMap((entry) => {
     const absolute = resolve(dir, entry.name);
     if (entry.isDirectory()) {
@@ -421,6 +453,10 @@ function expectSourceContains(subpath: string, snippet: string) {
 
 function expectSourceOmitsSnippet(subpath: string, snippet: string) {
   expect(readPluginSdkSource(subpath)).not.toContain(snippet);
+}
+
+function expectRepoSourceOmitsSnippet(relativePath: string, snippet: string) {
+  expect(readRepoSource(relativePath)).not.toContain(snippet);
 }
 
 function expectSourceOmitsImportPattern(subpath: string, specifier: string) {
@@ -544,13 +580,17 @@ describe("plugin-sdk subpath exports", () => {
     ]);
     expectSourceMentions("reply-chunking", ["chunkText", "chunkTextWithMode"]);
     expectSourceMentions("reply-history", [
+      "buildInboundHistoryFromEntries",
+      "buildInboundHistoryFromMap",
       "buildPendingHistoryContextFromMap",
       "clearHistoryEntriesIfEnabled",
+      "createChannelHistoryWindow",
       "recordPendingHistoryEntryIfEnabled",
     ]);
     expectSourceMentions("mattermost", [
       "buildPendingHistoryContextFromMap",
       "clearHistoryEntriesIfEnabled",
+      "createChannelHistoryWindow",
       "formatPairingApproveHint",
       "recordPendingHistoryEntryIfEnabled",
       "resolveControlCommandGate",
@@ -782,6 +822,21 @@ describe("plugin-sdk subpath exports", () => {
       .toSorted();
 
     expect(violations).toStrictEqual([]);
+  });
+
+  it("lists repo source candidates from git without walking SDK boundary roots", () => {
+    const readDir = vi.spyOn(fs, "readdirSync");
+    try {
+      repoTsFilesCache.clear();
+      const files = listRepoTsFiles(resolve(REPO_ROOT, "src"));
+
+      expect(files.length).toBeGreaterThan(0);
+      expect(files.every((file) => file.endsWith(".ts"))).toBe(true);
+      expect(readDir).not.toHaveBeenCalled();
+    } finally {
+      readDir.mockRestore();
+      repoTsFilesCache.clear();
+    }
   });
 
   it("keeps the deprecated channel-runtime shim unused in repo imports", () => {
@@ -1200,9 +1255,9 @@ describe("plugin-sdk subpath exports", () => {
     expectSourceOmitsSnippet("google-model-id", "./google.js");
     expectSourceOmitsSnippet("google-model-id", "./facade-runtime.js");
     expectSourceOmitsSnippet("google-model-id", "../../extensions/");
-    expectSourceOmitsSnippet("xai-model-id", "./xai.js");
-    expectSourceOmitsSnippet("xai-model-id", "./facade-runtime.js");
-    expectSourceOmitsSnippet("xai-model-id", "../../extensions/");
+    expectRepoSourceOmitsSnippet("extensions/xai/model-id.ts", "./xai.js");
+    expectRepoSourceOmitsSnippet("extensions/xai/model-id.ts", "./facade-runtime.js");
+    expectRepoSourceOmitsSnippet("extensions/xai/model-id.ts", "../../extensions/");
     expectSourceMentions("sandbox", ["registerSandboxBackend", "runPluginCommandWithTimeout"]);
 
     expectSourceMentions("secret-input", [
@@ -1285,7 +1340,6 @@ describe("plugin-sdk subpath exports", () => {
     const globalSingletonSdk = await importResolvedPluginSdkSubpath(
       "openclaw/plugin-sdk/global-singleton",
     );
-    const textRuntimeSdk = await importResolvedPluginSdkSubpath("openclaw/plugin-sdk/text-runtime");
     const pluginEntrySdk = await importResolvedPluginSdkSubpath("openclaw/plugin-sdk/plugin-entry");
     const channelLifecycleSdk = await importResolvedPluginSdkSubpath(
       "openclaw/plugin-sdk/channel-lifecycle",
@@ -1312,11 +1366,6 @@ describe("plugin-sdk subpath exports", () => {
     expect(globalSingletonSdk.createScopedExpiringIdCache).toBe(
       globalSingletonDirectSdk.createScopedExpiringIdCache,
     );
-    expect(textRuntimeSdk.createScopedExpiringIdCache).toBe(
-      textRuntimeDirectSdk.createScopedExpiringIdCache,
-    );
-    expect(textRuntimeSdk.resolveGlobalMap).toBe(textRuntimeDirectSdk.resolveGlobalMap);
-    expect(textRuntimeSdk.resolveGlobalSingleton).toBe(textRuntimeDirectSdk.resolveGlobalSingleton);
     expectSourceMentions("delivery-queue-runtime", ["drainPendingDeliveries"]);
     expectSourceContains("delivery-queue-runtime", "../infra/outbound/deliver-runtime.js");
     expectSourceMentions("error-runtime", ["formatUncaughtError", "isApprovalNotFoundError"]);

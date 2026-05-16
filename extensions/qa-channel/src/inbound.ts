@@ -1,5 +1,5 @@
 import { resolveStableChannelMessageIngress } from "openclaw/plugin-sdk/channel-ingress-runtime";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { resolveInboundRouteEnvelopeBuilderWithRuntime } from "openclaw/plugin-sdk/inbound-envelope";
 import {
   buildAgentMediaPayload,
@@ -19,6 +19,18 @@ export function isHttpMediaUrl(value: string): boolean {
   }
 }
 
+function normalizeBase64ForCompare(value: string): string {
+  return value.replace(/=+$/u, "").replace(/-/gu, "+").replace(/_/gu, "/");
+}
+
+function decodeAttachmentBase64(value: string): Buffer | null {
+  const buffer = Buffer.from(value, "base64");
+  if (normalizeBase64ForCompare(buffer.toString("base64")) !== normalizeBase64ForCompare(value)) {
+    return null;
+  }
+  return buffer;
+}
+
 async function resolveQaInboundMediaPayload(attachments: QaBusMessage["attachments"]) {
   if (!Array.isArray(attachments) || attachments.length === 0) {
     return {};
@@ -29,8 +41,13 @@ async function resolveQaInboundMediaPayload(attachments: QaBusMessage["attachmen
       continue;
     }
     if (typeof attachment.contentBase64 === "string" && attachment.contentBase64.trim()) {
+      const buffer = decodeAttachmentBase64(attachment.contentBase64);
+      if (!buffer) {
+        console.warn("[qa-channel] inbound attachment contentBase64 rejected (invalid base64)");
+        continue;
+      }
       const saved = await saveMediaBuffer(
-        Buffer.from(attachment.contentBase64, "base64"),
+        buffer,
         attachment.mimeType,
         "inbound",
         undefined,

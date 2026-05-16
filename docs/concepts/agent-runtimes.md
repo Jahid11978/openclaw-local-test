@@ -94,7 +94,11 @@ This is the agent-facing decision tree:
    `agentRuntime.id: "pi"`. A selected `openai-codex` auth profile is routed
    internally through PI's legacy Codex-auth transport.
 4. If legacy config still contains **`openai-codex/*` model refs**, repair it to
-   `openai/<model>` with `openclaw doctor --fix`.
+   `openai/<model>` with `openclaw doctor --fix`; doctor keeps the Codex auth
+   route by adding provider/model-scoped `agentRuntime.id: "codex"` where the
+   old model ref implied it.
+   Legacy **`codex-cli/*` model refs** repair to the same `openai/<model>` Codex
+   app-server route; OpenClaw no longer keeps a bundled Codex CLI backend.
 5. If the user explicitly says **ACP**, **acpx**, or **Codex ACP adapter**, use
    ACP with `runtime: "acp"` and `agentId: "codex"`.
 6. If the request is for **Claude Code, Gemini CLI, OpenCode, Cursor, Droid, or
@@ -137,7 +141,10 @@ OpenClaw chooses an embedded runtime after provider and model resolution:
 
 1. Model-scoped runtime policy wins. This can live in a configured provider
    model entry or in `agents.defaults.models["provider/model"].agentRuntime` /
-   `agents.list[].models["provider/model"].agentRuntime`.
+   `agents.list[].models["provider/model"].agentRuntime`. A provider wildcard
+   such as `agents.defaults.models["vllm/*"].agentRuntime` applies after exact
+   model policy, so dynamically discovered provider models can share one
+   runtime without overriding exact per-model exceptions.
 2. Provider-scoped runtime policy comes next at
    `models.providers.<provider>.agentRuntime`.
 3. In `auto` mode, registered plugin runtimes can claim supported provider/model
@@ -177,6 +184,10 @@ Claude CLI form is:
 Legacy refs such as `claude-cli/claude-opus-4-7` remain supported for
 compatibility, but new config should keep the provider/model canonical and put
 the execution backend in provider/model runtime policy.
+
+Legacy `codex-cli/*` refs are different: doctor migrates them to `openai/*` so
+they run through the Codex app-server harness instead of preserving a Codex CLI
+backend.
 
 `auto` mode is intentionally conservative for most providers. OpenAI agent
 models are the exception: unset runtime and `auto` both resolve to the Codex

@@ -1,4 +1,4 @@
-import type { ImageContent } from "@mariozechner/pi-ai";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import type { PromptImageOrderEntry } from "../media/prompt-image-order.js";
 import type { ReplyPayload } from "./reply-payload.js";
 import type { TypingController } from "./reply/typing.js";
@@ -30,6 +30,15 @@ export type ReplyThreadingPolicy = {
 };
 
 export type SourceReplyDeliveryMode = "automatic" | "message_tool_only";
+
+export type QueuedReplyDeliveryCorrelation = {
+  begin: () => (() => void) | void;
+};
+
+export type QueuedReplyLifecycle = {
+  onEnqueued?: () => void;
+  onComplete?: () => void;
+};
 
 export type PartialReplyPayload = Pick<ReplyPayload, "text" | "mediaUrls"> & {
   delta?: string;
@@ -172,6 +181,10 @@ export type GetReplyOptions = {
    * output private; visible channel output must come from the message tool.
    */
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
+  /** Starts delivery tracking when this turn later drains as a queued followup. */
+  queuedDeliveryCorrelations?: QueuedReplyDeliveryCorrelation[];
+  /** Tracks ownership transfer when this turn later drains as a queued followup. */
+  queuedFollowupLifecycle?: QueuedReplyLifecycle;
   /** Allow channel-owned progress UI while final/source reply delivery remains message-tool-only. */
   allowProgressCallbacksWhenSourceDeliverySuppressed?: boolean;
   disableBlockStreaming?: boolean;
@@ -183,4 +196,8 @@ export type GetReplyOptions = {
   hasRepliedRef?: { value: boolean };
   /** Override agent timeout in seconds (0 = no timeout). Threads through to resolveAgentTimeoutMs. */
   timeoutOverrideSeconds?: number;
+  /** Capability-checked one-turn model override for inline image input. */
+  modelOverride?: string;
+  /** Capability-checked runtime fallbacks for the one-turn image model override. */
+  modelOverrideFallbacks?: string[];
 };

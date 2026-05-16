@@ -54,6 +54,43 @@ vi.mock("openclaw/plugin-sdk/runtime-env", () => ({
 }));
 vi.mock("openclaw/plugin-sdk/reply-history", () => ({
   DEFAULT_GROUP_HISTORY_LIMIT: 20,
+  createChannelHistoryWindow: ({ historyMap }: { historyMap: Map<string, HistoryEntry[]> }) => ({
+    record: ({
+      historyKey,
+      limit,
+      entry,
+    }: {
+      historyKey: string;
+      limit: number;
+      entry: HistoryEntry;
+    }) => {
+      const existing = historyMap.get(historyKey) ?? [];
+      historyMap.set(historyKey, [...existing, entry].slice(-limit));
+    },
+    buildInboundHistory: ({ historyKey, limit }: { historyKey: string; limit: number }) => {
+      if (limit <= 0) {
+        return undefined;
+      }
+      return (historyMap.get(historyKey) ?? []).slice(-limit);
+    },
+    clear: ({ historyKey }: { historyKey: string }) => {
+      historyMap.delete(historyKey);
+    },
+  }),
+  buildInboundHistoryFromMap: ({
+    historyMap,
+    historyKey,
+    limit,
+  }: {
+    historyMap: Map<string, HistoryEntry[]>;
+    historyKey: string;
+    limit: number;
+  }) => {
+    if (limit <= 0) {
+      return undefined;
+    }
+    return (historyMap.get(historyKey) ?? []).slice(-limit);
+  },
   clearHistoryEntriesIfEnabled: ({
     historyMap,
     historyKey,
@@ -84,7 +121,7 @@ vi.mock("openclaw/plugin-sdk/routing", () => ({
 
 const { readAllowFromStoreMock, upsertPairingRequestMock } = vi.hoisted(() => ({
   readAllowFromStoreMock: vi.fn(async () => [] as string[]),
-  upsertPairingRequestMock: vi.fn(async () => ({ code: "CODE", created: true })),
+  upsertPairingRequestMock: vi.fn(async (_args: unknown) => ({ code: "CODE", created: true })),
 }));
 
 vi.mock("openclaw/plugin-sdk/conversation-runtime", () => ({
@@ -609,13 +646,12 @@ describe("handleLineWebhookEvents", () => {
     });
 
     expect(processMessage).not.toHaveBeenCalled();
-    expect(upsertPairingRequestMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        channel: "line",
-        id: "user-5",
-        accountId: "default",
-      }),
-    );
+    const pairingRequest = (upsertPairingRequestMock.mock.calls as unknown[][])[0]?.[0] as
+      | { accountId?: string; channel?: string; id?: string }
+      | undefined;
+    expect(pairingRequest?.channel).toBe("line");
+    expect(pairingRequest?.id).toBe("user-5");
+    expect(pairingRequest?.accountId).toBe("default");
   });
 
   it("does not authorize DM senders from another account's pairing-store entries", async () => {
@@ -657,13 +693,12 @@ describe("handleLineWebhookEvents", () => {
 
     expect(readAllowFromStoreMock).toHaveBeenCalledWith("line", undefined, "work");
     expect(processMessage).not.toHaveBeenCalled();
-    expect(upsertPairingRequestMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        channel: "line",
-        id: "cross-account-user",
-        accountId: "work",
-      }),
-    );
+    const pairingRequest = (upsertPairingRequestMock.mock.calls as unknown[][])[0]?.[0] as
+      | { accountId?: string; channel?: string; id?: string }
+      | undefined;
+    expect(pairingRequest?.channel).toBe("line");
+    expect(pairingRequest?.id).toBe("cross-account-user");
+    expect(pairingRequest?.accountId).toBe("work");
   });
 
   it("deduplicates replayed webhook events by webhookEventId before processing", async () => {
@@ -875,11 +910,10 @@ describe("handleLineWebhookEvents", () => {
     expect(processMessage).not.toHaveBeenCalled();
     const entries = groupHistories.get("group-hist-1");
     expect(entries).toHaveLength(1);
-    expect(entries?.[0]).toMatchObject({
-      sender: "user:user-hist",
-      body: "hello history",
-      timestamp: 1700000000000,
-    });
+    const entry = entries?.[0];
+    expect(entry?.sender).toBe("user:user-hist");
+    expect(entry?.body).toBe("hello history");
+    expect(entry?.timestamp).toBe(1700000000000);
   });
 
   it("skips group messages without mention when requireMention is set", async () => {
@@ -1033,7 +1067,7 @@ describe("handleLineWebhookEvents", () => {
     expect(buildLineMessageContextMock).toHaveBeenCalledTimes(1);
     expect(processMessage).toHaveBeenCalledTimes(1);
     expect(context.runtime.error).toHaveBeenCalledWith(
-      expect.stringContaining("line: event handler failed: Error: transient failure"),
+      "line: event handler failed: Error: transient failure",
     );
   });
 

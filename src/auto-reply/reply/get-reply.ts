@@ -1,11 +1,12 @@
 import fs from "node:fs/promises";
 import {
+  resolveAgentConfig,
   resolveAgentDir,
   resolveAgentWorkspaceDir,
   resolveSessionAgentId,
   resolveAgentSkillsFilter,
 } from "../../agents/agent-scope.js";
-import { resolveModelRefFromString } from "../../agents/model-selection.js";
+import { modelKey, resolveModelRefFromString } from "../../agents/model-selection.js";
 import { resolveAgentTimeoutMs } from "../../agents/timeout.js";
 import { DEFAULT_AGENT_WORKSPACE_DIR, ensureAgentWorkspace } from "../../agents/workspace.js";
 import { resolveChannelModelOverride } from "../../channels/model-overrides.js";
@@ -18,7 +19,9 @@ import { defaultRuntime } from "../../runtime.js";
 import { createLazyImportLoader } from "../../shared/lazy-promise.js";
 import { normalizeOptionalString } from "../../shared/string-coerce.js";
 import { normalizeStringEntries } from "../../shared/string-normalization.js";
+import { resolveCommandTurnTargetSessionKey } from "../command-turn-context.js";
 import type { GetReplyOptions } from "../get-reply-options.types.js";
+import { DEFAULT_HEARTBEAT_ACK_MAX_CHARS, stripHeartbeatToken } from "../heartbeat.js";
 import type { ReplyPayload } from "../reply-payload.js";
 import type { MsgContext } from "../templating.js";
 import { normalizeVerboseLevel } from "../thinking.js";
@@ -42,6 +45,7 @@ import { finalizeInboundContext } from "./inbound-context.js";
 import { hasInboundMedia } from "./inbound-media.js";
 import { emitPreAgentMessageHooks } from "./message-preprocess-hooks.js";
 import { createFastTestModelSelectionState } from "./model-selection.js";
+import { sanitizePendingFinalDeliveryText } from "./pending-final-delivery.js";
 import { initSessionState } from "./session.js";
 import {
   isStaleHeartbeatAutoFallbackOverride,
@@ -50,6 +54,27 @@ import {
 import { createTypingController } from "./typing.js";
 
 type ResetCommandAction = "new" | "reset";
+
+function classifyHeartbeatPendingFinalDelivery(text: string, ackMaxChars: number) {
+  const stripped = stripHeartbeatToken(text, {
+    mode: "heartbeat",
+    maxAckChars: ackMaxChars,
+  });
+  return {
+    shouldClear: stripped.shouldSkip,
+    replayText: stripped.didStrip && stripped.text ? stripped.text : text,
+  };
+}
+
+function resolveHeartbeatAckMaxChars(cfg: OpenClawConfig, agentId: string): number {
+  const agentHeartbeat = resolveAgentConfig(cfg, agentId)?.heartbeat;
+  return Math.max(
+    0,
+    agentHeartbeat?.ackMaxChars ??
+      cfg.agents?.defaults?.heartbeat?.ackMaxChars ??
+      DEFAULT_HEARTBEAT_ACK_MAX_CHARS,
+  );
+}
 
 const sessionResetModelRuntimeLoader = createLazyImportLoader(
   () => import("./session-reset-model.runtime.js"),
@@ -194,16 +219,14 @@ export async function getReplyFromConfig(
     cfg,
     isFastTestEnv,
   });
-  const targetSessionKey =
-    ctx.CommandSource === "native"
-      ? normalizeOptionalString(ctx.CommandTargetSessionKey)
-      : undefined;
-  const agentSessionKey = targetSessionKey || ctx.SessionKey;
+  const finalized = finalizeInboundContext(ctx);
+  const targetSessionKey = resolveCommandTurnTargetSessionKey(finalized);
+  const agentSessionKey = targetSessionKey || finalized.SessionKey;
   const traceAttributes = {
-    surface: normalizeOptionalString(ctx.Surface ?? ctx.Provider) ?? "unknown",
+    surface: normalizeOptionalString(finalized.Surface ?? finalized.Provider) ?? "unknown",
     hasSessionKey: Boolean(agentSessionKey),
     isHeartbeat: opts?.isHeartbeat === true,
-    hasMedia: hasInboundMedia(ctx),
+    hasMedia: hasInboundMedia(finalized),
   };
   const traceGetReplyPhase = <T>(name: string, run: () => Promise<T> | T): Promise<T> =>
     measureDiagnosticsTimelineSpan(name, run, {
@@ -230,7 +253,28 @@ export async function getReplyFromConfig(
   let provider = defaultProvider;
   let model = defaultModel;
   let hasResolvedHeartbeatModelOverride = false;
-  if (opts?.isHeartbeat) {
+  let hasAppliedImageModelOverride = false;
+  let imageModelFallbacksOverride: string[] | undefined;
+  const modelOverrideRaw = normalizeOptionalString(opts?.modelOverride);
+  if (modelOverrideRaw) {
+    const modelOverrideRef = resolveModelRefFromString({
+      raw: modelOverrideRaw,
+      defaultProvider,
+      aliasIndex,
+    });
+    if (modelOverrideRef) {
+      provider = modelOverrideRef.ref.provider;
+      model = modelOverrideRef.ref.model;
+      hasAppliedImageModelOverride = true;
+      imageModelFallbacksOverride = opts?.modelOverrideFallbacks?.filter(
+        (fallback): fallback is string => normalizeOptionalString(fallback) !== undefined,
+      );
+    } else {
+      defaultRuntime.log?.(
+        `[image-model-switch] Failed to resolve image model override ${modelOverrideRaw}; using default model ${modelKey(defaultProvider, defaultModel)}`,
+      );
+    }
+  } else if (opts?.isHeartbeat) {
     // Prefer the resolved per-agent heartbeat model passed from the heartbeat runner,
     // fall back to the global defaults heartbeat model for backward compatibility.
     const heartbeatRaw =
@@ -268,7 +312,6 @@ export async function getReplyFromConfig(
   });
   opts?.onTypingController?.(typing);
 
-  const finalized = finalizeInboundContext(ctx);
   const nativeSlashCommandFastReply = await traceGetReplyPhase(
     "reply.native_slash_command_fast_path",
     () =>
@@ -365,35 +408,71 @@ export async function getReplyFromConfig(
   } = sessionState;
 
   if (sessionEntry?.pendingFinalDelivery && sessionEntry.pendingFinalDeliveryText) {
-    const text = sessionEntry.pendingFinalDeliveryText;
+    const text = sanitizePendingFinalDeliveryText(sessionEntry.pendingFinalDeliveryText);
 
     // If it's a heartbeat, we definitely want to try delivering the lost reply now.
     // If it's a user message, we deliver the lost reply first, then continue.
     // For now, let's just return the lost reply if it's a heartbeat.
     if (opts?.isHeartbeat) {
-      const updatedAt = Date.now();
-      const attemptCount = (sessionEntry.pendingFinalDeliveryAttemptCount ?? 0) + 1;
-      sessionEntry.pendingFinalDeliveryLastAttemptAt = updatedAt;
-      sessionEntry.pendingFinalDeliveryAttemptCount = attemptCount;
-      sessionEntry.pendingFinalDeliveryLastError = null;
-      sessionEntry.updatedAt = updatedAt;
-      if (sessionKey && sessionStore) {
-        sessionStore[sessionKey] = sessionEntry;
+      const heartbeatPending = classifyHeartbeatPendingFinalDelivery(
+        text,
+        resolveHeartbeatAckMaxChars(cfg, agentId),
+      );
+      if (heartbeatPending.shouldClear) {
+        sessionEntry.pendingFinalDelivery = undefined;
+        sessionEntry.pendingFinalDeliveryText = undefined;
+        sessionEntry.pendingFinalDeliveryCreatedAt = undefined;
+        sessionEntry.pendingFinalDeliveryLastAttemptAt = undefined;
+        sessionEntry.pendingFinalDeliveryAttemptCount = undefined;
+        sessionEntry.pendingFinalDeliveryLastError = undefined;
+        sessionEntry.pendingFinalDeliveryContext = undefined;
+        if (sessionKey && sessionStore) {
+          sessionStore[sessionKey] = sessionEntry;
+        }
+        if (sessionKey && storePath) {
+          const { updateSessionStoreEntry } = await import("../../config/sessions.js");
+          await updateSessionStoreEntry({
+            storePath,
+            sessionKey,
+            update: async () => ({
+              pendingFinalDelivery: undefined,
+              pendingFinalDeliveryText: undefined,
+              pendingFinalDeliveryCreatedAt: undefined,
+              pendingFinalDeliveryLastAttemptAt: undefined,
+              pendingFinalDeliveryAttemptCount: undefined,
+              pendingFinalDeliveryLastError: undefined,
+              pendingFinalDeliveryContext: undefined,
+            }),
+          });
+        }
+      } else {
+        const updatedAt = Date.now();
+        const attemptCount = (sessionEntry.pendingFinalDeliveryAttemptCount ?? 0) + 1;
+        sessionEntry.pendingFinalDeliveryLastAttemptAt = updatedAt;
+        sessionEntry.pendingFinalDeliveryAttemptCount = attemptCount;
+        sessionEntry.pendingFinalDeliveryLastError = null;
+        const replayText = sanitizePendingFinalDeliveryText(heartbeatPending.replayText);
+        sessionEntry.pendingFinalDeliveryText = replayText;
+        sessionEntry.updatedAt = updatedAt;
+        if (sessionKey && sessionStore) {
+          sessionStore[sessionKey] = sessionEntry;
+        }
+        if (sessionKey && storePath) {
+          const { updateSessionStoreEntry } = await import("../../config/sessions.js");
+          await updateSessionStoreEntry({
+            storePath,
+            sessionKey,
+            update: async () => ({
+              pendingFinalDeliveryText: replayText,
+              pendingFinalDeliveryLastAttemptAt: updatedAt,
+              pendingFinalDeliveryAttemptCount: attemptCount,
+              pendingFinalDeliveryLastError: null,
+              updatedAt,
+            }),
+          });
+        }
+        return { text: replayText };
       }
-      if (sessionKey && storePath) {
-        const { updateSessionStoreEntry } = await import("../../config/sessions.js");
-        await updateSessionStoreEntry({
-          storePath,
-          sessionKey,
-          update: async () => ({
-            pendingFinalDeliveryLastAttemptAt: updatedAt,
-            pendingFinalDeliveryAttemptCount: attemptCount,
-            pendingFinalDeliveryLastError: null,
-            updatedAt,
-          }),
-        });
-      }
-      return { text };
     }
   }
 
@@ -472,6 +551,7 @@ export async function getReplyFromConfig(
   if (
     storedModelOverride?.model &&
     !hasResolvedHeartbeatModelOverride &&
+    !hasAppliedImageModelOverride &&
     !staleHeartbeatAutoFallbackOverride
   ) {
     provider = storedModelOverride.provider ?? defaultProvider;
@@ -482,11 +562,32 @@ export async function getReplyFromConfig(
   if (
     !hasResolvedHeartbeatModelOverride &&
     !hasEffectiveSessionModelOverride &&
+    !hasAppliedImageModelOverride &&
     resolvedChannelModelOverride
   ) {
     provider = resolvedChannelModelOverride.ref.provider;
     model = resolvedChannelModelOverride.ref.model;
   }
+  const imageModelOverrideBaseProvider = hasAppliedImageModelOverride
+    ? (() => {
+        if (
+          storedModelOverride?.model &&
+          !hasResolvedHeartbeatModelOverride &&
+          !staleHeartbeatAutoFallbackOverride
+        ) {
+          return storedModelOverride.provider ?? defaultProvider;
+        }
+        if (!hasEffectiveSessionModelOverride && resolvedChannelModelOverride) {
+          return resolvedChannelModelOverride.ref.provider;
+        }
+        const runtimeProvider = normalizeOptionalString(sessionEntry.modelProvider);
+        const runtimeModel = normalizeOptionalString(sessionEntry.model);
+        if (runtimeProvider && runtimeModel) {
+          return runtimeProvider;
+        }
+        return defaultProvider;
+      })()
+    : undefined;
 
   if (
     shouldUseReplyFastDirectiveExecution({
@@ -561,6 +662,9 @@ export async function getReplyFromConfig(
         storePath,
         workspaceDir,
         abortedLastRun,
+        hasAppliedImageModelOverride,
+        imageModelOverrideBaseProvider,
+        imageModelFallbacksOverride,
       }),
     );
   }
@@ -591,6 +695,7 @@ export async function getReplyFromConfig(
       aliasIndex,
       provider,
       model,
+      hasOneTurnModelOverride: hasAppliedImageModelOverride,
       hasResolvedHeartbeatModelOverride,
       typing,
       opts: resolvedOpts,
@@ -702,6 +807,7 @@ export async function getReplyFromConfig(
   }
   await maybeEmitMissingResetHooks();
   directives = inlineActionResult.directives;
+  cleanedBody = inlineActionResult.cleanedBody;
   abortedLastRun = inlineActionResult.abortedLastRun ?? abortedLastRun;
 
   // Allow plugins to intercept and return a synthetic reply before the LLM runs.
@@ -800,6 +906,9 @@ export async function getReplyFromConfig(
       storePath,
       workspaceDir,
       abortedLastRun,
+      hasAppliedImageModelOverride,
+      imageModelOverrideBaseProvider,
+      imageModelFallbacksOverride,
     }),
   );
 }

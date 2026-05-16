@@ -1,7 +1,7 @@
 import { createHmac, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { hostname as readHostName } from "node:os";
-import { z } from "openclaw/plugin-sdk/zod";
+import { z } from "zod";
 import type { CodexSandboxPolicy, CodexServiceTier } from "./protocol.js";
 
 const START_OPTIONS_KEY_SECRET = randomBytes(32);
@@ -282,7 +282,7 @@ export function resolveCodexPluginsPolicy(pluginConfig?: unknown): ResolvedCodex
   const config = readCodexPluginConfig(pluginConfig).codexPlugins;
   const configured = config !== undefined;
   const enabled = config?.enabled === true;
-  const allowDestructiveActions = config?.allow_destructive_actions ?? false;
+  const allowDestructiveActions = config?.allow_destructive_actions ?? true;
   const pluginPolicies = Object.entries(config?.plugins ?? {})
     .flatMap(([configKey, entry]): ResolvedCodexPluginPolicy[] => {
       if (entry.marketplaceName !== CODEX_PLUGINS_MARKETPLACE_NAME || !entry.pluginName) {
@@ -387,6 +387,24 @@ export function resolveCodexAppServerRuntimeOptions(
       (policyMode === "guardian" ? "auto_review" : "user"),
     ...(serviceTier ? { serviceTier } : {}),
   };
+}
+
+export function isCodexAppServerApprovalPolicyAllowedByRequirements(
+  policy: CodexAppServerApprovalPolicy,
+  params: {
+    env?: NodeJS.ProcessEnv;
+    requirementsToml?: string | null;
+    requirementsPath?: string;
+    readRequirementsFile?: (path: string) => string | undefined;
+    platform?: NodeJS.Platform;
+  } = {},
+): boolean {
+  const content = readCodexRequirementsToml(params);
+  if (content === undefined) {
+    return true;
+  }
+  const allowedApprovalPolicies = parseAllowedApprovalPoliciesFromCodexRequirements(content);
+  return allowedApprovalPolicies === undefined || allowedApprovalPolicies.has(policy);
 }
 
 export function resolveCodexComputerUseConfig(

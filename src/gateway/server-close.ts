@@ -9,10 +9,12 @@ import { createSubsystemLogger } from "../logging/subsystem.js";
 import { closePluginStateSqliteStore } from "../plugin-state/plugin-state-store.js";
 import type { PluginServicesHandle } from "../plugins/services.js";
 import { normalizeOptionalString } from "../shared/string-coerce.js";
+import type { GatewayPostReadySidecarHandle } from "./server-startup-post-attach.js";
 
 const shutdownLog = createSubsystemLogger("gateway/shutdown");
-const GATEWAY_SHUTDOWN_HOOK_TIMEOUT_MS = 1_000;
-const GATEWAY_PRE_RESTART_HOOK_TIMEOUT_MS = 1_000;
+const GATEWAY_SHUTDOWN_HOOK_TIMEOUT_MS = 5_000;
+const GATEWAY_PRE_RESTART_HOOK_TIMEOUT_MS = 10_000;
+const ACTIVE_SESSIONS_SHUTDOWN_DRAIN_TIMEOUT_MS = 2_000;
 const WEBSOCKET_CLOSE_GRACE_MS = 1_000;
 const WEBSOCKET_CLOSE_FORCE_CONTINUE_MS = 250;
 const HTTP_CLOSE_GRACE_MS = 1_000;
@@ -175,6 +177,7 @@ export function createGatewayCloseHandler(params: {
   channelIds?: readonly ChannelId[];
   stopChannel: (name: ChannelId, accountId?: string) => Promise<void>;
   pluginServices: PluginServicesHandle | null;
+  postReadySidecars?: readonly GatewayPostReadySidecarHandle[];
   disposeSessionMcpRuntimes?: () => Promise<void>;
   disposeBundleLspRuntimes?: () => Promise<void>;
   cron: { stop: () => void };
@@ -197,6 +200,10 @@ export function createGatewayCloseHandler(params: {
   wss: WebSocketServer;
   httpServer: HttpServer;
   httpServers?: HttpServer[];
+  drainActiveSessionsForShutdown?: (params: {
+    reason: "shutdown" | "restart";
+    totalTimeoutMs?: number;
+  }) => Promise<{ emittedSessionIds: string[]; timedOut: boolean }>;
 }) {
   return async (opts?: {
     reason?: string;
@@ -256,6 +263,26 @@ export function createGatewayCloseHandler(params: {
           warnings,
         );
       }
+      if (params.drainActiveSessionsForShutdown) {
+        await shutdownStep(
+          "session-end-drain",
+          async () => {
+            const drainReason: "shutdown" | "restart" =
+              restartExpectedMs !== null ? "restart" : "shutdown";
+            const result = await params.drainActiveSessionsForShutdown!({
+              reason: drainReason,
+              totalTimeoutMs: ACTIVE_SESSIONS_SHUTDOWN_DRAIN_TIMEOUT_MS,
+            });
+            if (result.timedOut) {
+              shutdownLog.warn(
+                `session-end-drain timed out after ${ACTIVE_SESSIONS_SHUTDOWN_DRAIN_TIMEOUT_MS}ms after ${result.emittedSessionIds.length} sessions; continuing shutdown`,
+              );
+              recordShutdownWarning(warnings, "session-end-drain");
+            }
+          },
+          warnings,
+        );
+      }
       if (params.bonjourStop) {
         await shutdownStep("bonjour", () => params.bonjourStop!(), warnings);
       }
@@ -285,6 +312,7 @@ export function createGatewayCloseHandler(params: {
         await shutdownStep("plugin-services", () => params.pluginServices!.stop(), warnings);
       }
       await shutdownStep("plugin-state-store", () => closePluginStateSqliteStore(), warnings);
+      await shutdownStep("config-reloader", () => params.configReloader.stop(), warnings);
       await shutdownStep("gmail-watcher", () => stopGmailWatcherOnDemand(), warnings);
       params.cron.stop();
       params.heartbeatRunner.stop();
@@ -334,7 +362,6 @@ export function createGatewayCloseHandler(params: {
         recordShutdownWarning(warnings, "ws-clients");
       }
       params.clients.clear();
-      await shutdownStep("config-reloader", () => params.configReloader.stop(), warnings);
       const wsClients = params.wss.clients ?? new Set();
       const closePromise = new Promise<void>((resolve) => params.wss.close(() => resolve()));
       const websocketGraceTimeout = createTimeoutRace(

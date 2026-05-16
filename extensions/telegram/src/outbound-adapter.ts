@@ -4,10 +4,11 @@ import {
   createAttachedChannelResultAdapter,
 } from "openclaw/plugin-sdk/channel-send-result";
 import {
+  normalizeMessagePresentation,
   presentationToInteractiveReply,
   renderMessagePresentationFallbackText,
 } from "openclaw/plugin-sdk/interactive-runtime";
-import { sanitizeForPlainText } from "openclaw/plugin-sdk/outbound-runtime";
+import type { OutboundDeliveryFormattingOptions } from "openclaw/plugin-sdk/outbound-runtime";
 import {
   resolveOutboundSendDep,
   type OutboundSendDeps,
@@ -19,7 +20,7 @@ import {
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-runtime";
 import type { TelegramInlineButtons } from "./button-types.js";
 import { resolveTelegramInlineButtons } from "./button-types.js";
-import { markdownToTelegramHtmlChunks } from "./format.js";
+import { markdownToTelegramHtmlChunks, splitTelegramHtmlChunks } from "./format.js";
 import { resolveTelegramInteractiveTextFallback } from "./interactive-fallback.js";
 import { parseTelegramReplyToMessageId, parseTelegramThreadId } from "./outbound-params.js";
 
@@ -46,12 +47,23 @@ async function resolveDefaultTelegramSend(deps?: OutboundSendDeps): Promise<Tele
   );
 }
 
+function chunkTelegramOutboundText(
+  text: string,
+  limit: number,
+  ctx?: { formatting?: OutboundDeliveryFormattingOptions },
+): string[] {
+  return ctx?.formatting?.parseMode === "HTML"
+    ? splitTelegramHtmlChunks(text, limit)
+    : markdownToTelegramHtmlChunks(text, limit);
+}
+
 async function resolveTelegramSendContext(params: {
   cfg: NonNullable<TelegramSendOpts>["cfg"];
   deps?: OutboundSendDeps;
   accountId?: string | null;
   replyToId?: string | null;
   threadId?: string | number | null;
+  formatting?: OutboundDeliveryFormattingOptions;
   silent?: boolean;
   gatewayClientScopes?: readonly string[];
   resolveSend: ResolveTelegramSendFn;
@@ -60,7 +72,7 @@ async function resolveTelegramSendContext(params: {
   baseOpts: {
     cfg: NonNullable<TelegramSendOpts>["cfg"];
     verbose: false;
-    textMode: "html";
+    textMode?: "html";
     messageThreadId?: number;
     replyToMessageId?: number;
     accountId?: string;
@@ -73,13 +85,13 @@ async function resolveTelegramSendContext(params: {
     send,
     baseOpts: {
       verbose: false,
-      textMode: "html",
       cfg: params.cfg,
       messageThreadId: parseTelegramThreadId(params.threadId),
       replyToMessageId: parseTelegramReplyToMessageId(params.replyToId),
       accountId: params.accountId ?? undefined,
       silent: params.silent,
       gatewayClientScopes: params.gatewayClientScopes,
+      ...(params.formatting?.parseMode === "HTML" ? { textMode: "html" as const } : {}),
     },
   };
 }
@@ -105,15 +117,20 @@ export async function sendTelegramPayloadMessages(params: {
     | undefined;
   const quoteText =
     typeof telegramData?.quoteText === "string" ? telegramData.quoteText : undefined;
+  const presentation = normalizeMessagePresentation(params.payload.presentation);
+  const interactive =
+    params.payload.interactive ??
+    (presentation ? presentationToInteractiveReply(presentation) : undefined);
   const text =
     resolveTelegramInteractiveTextFallback({
       text: params.payload.text,
-      interactive: params.payload.interactive,
+      interactive,
+      presentation,
     }) ?? "";
   const mediaUrls = resolvePayloadMediaUrls(params.payload);
   const buttons = resolveTelegramInlineButtons({
     buttons: telegramData?.buttons,
-    interactive: params.payload.interactive,
+    interactive,
   });
   const payloadOpts = {
     ...params.baseOpts,
@@ -148,12 +165,11 @@ export function createTelegramOutboundAdapter(
 
   return {
     deliveryMode: "direct",
-    chunker: markdownToTelegramHtmlChunks,
+    chunker: chunkTelegramOutboundText,
     chunkerMode: "markdown",
+    chunkedTextFormatting: { parseMode: "HTML" },
     extractMarkdownImages: true,
     textChunkLimit: TELEGRAM_TEXT_CHUNK_LIMIT,
-    sanitizeText: ({ text }) => sanitizeForPlainText(text),
-    shouldSkipPlainTextSanitization: ({ payload }) => Boolean(payload.channelData),
     shouldSuppressLocalPayloadPrompt: options.shouldSuppressLocalPayloadPrompt,
     beforeDeliverPayload: options.beforeDeliverPayload,
     shouldTreatDeliveredTextAsVisible: options.shouldTreatDeliveredTextAsVisible,
@@ -209,6 +225,7 @@ export function createTelegramOutboundAdapter(
         deps,
         replyToId,
         threadId,
+        formatting,
         silent,
         gatewayClientScopes,
       }) => {
@@ -218,6 +235,7 @@ export function createTelegramOutboundAdapter(
           accountId,
           replyToId,
           threadId,
+          formatting,
           silent,
           gatewayClientScopes,
           resolveSend,
@@ -237,6 +255,7 @@ export function createTelegramOutboundAdapter(
         deps,
         replyToId,
         threadId,
+        formatting,
         forceDocument,
         silent,
         gatewayClientScopes,
@@ -247,6 +266,7 @@ export function createTelegramOutboundAdapter(
           accountId,
           replyToId,
           threadId,
+          formatting,
           silent,
           gatewayClientScopes,
           resolveSend,
@@ -270,6 +290,7 @@ export function createTelegramOutboundAdapter(
       deps,
       replyToId,
       threadId,
+      formatting,
       forceDocument,
       silent,
       gatewayClientScopes,
@@ -280,6 +301,7 @@ export function createTelegramOutboundAdapter(
         accountId,
         replyToId,
         threadId,
+        formatting,
         silent,
         gatewayClientScopes,
         resolveSend,

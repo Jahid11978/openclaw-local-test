@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { Api, Model } from "@mariozechner/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import { resolveHeartbeatPromptForResponseTool } from "../../../src/auto-reply/heartbeat.js";
 import {
   buildDirectChatContext,
@@ -136,7 +136,7 @@ const CODEX_WORKSPACE_BOOTSTRAP_INSTRUCTIONS = [
   "# Project Context",
   "",
   "The following project context files have been loaded:",
-  "If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it.",
+  "SOUL.md: persona/tone. Follow it unless higher-priority instructions override.",
   "",
   ...CODEX_WORKSPACE_BOOTSTRAP_CONTEXT_FILES.flatMap((file) => [
     `## ${file.path}`,
@@ -442,9 +442,6 @@ function createScenarios(): PromptScenario[] {
         chatContext: buildDirectChatContext({
           sessionCtx: telegramDirectCtx,
           sourceReplyDeliveryMode: "message_tool_only",
-          silentReplyPolicy: "disallow",
-          silentReplyRewrite: false,
-          silentToken: SILENT_REPLY_TOKEN,
         }),
       }),
       dynamicTools: telegramDirectTools,
@@ -469,7 +466,6 @@ function createScenarios(): PromptScenario[] {
           sessionCtx: discordGroupCtx,
           sourceReplyDeliveryMode: "message_tool_only",
           silentReplyPolicy: "allow",
-          silentReplyRewrite: false,
           silentToken: SILENT_REPLY_TOKEN,
         }),
         intro: buildGroupIntro({
@@ -478,7 +474,6 @@ function createScenarios(): PromptScenario[] {
           defaultActivation: "mention",
           silentToken: SILENT_REPLY_TOKEN,
           silentReplyPolicy: "allow",
-          silentReplyRewrite: false,
         }),
       }),
       dynamicTools: discordGroupTools,
@@ -499,9 +494,6 @@ function createScenarios(): PromptScenario[] {
         chatContext: buildDirectChatContext({
           sessionCtx: heartbeatCtx,
           sourceReplyDeliveryMode: "message_tool_only",
-          silentReplyPolicy: "disallow",
-          silentReplyRewrite: false,
-          silentToken: SILENT_REPLY_TOKEN,
         }),
       }),
       dynamicTools: heartbeatTools,

@@ -1,9 +1,14 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { SessionManager } from "@mariozechner/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { EmbeddedRunAttemptParams } from "openclaw/plugin-sdk/agent-harness";
 import { resetAgentEventsForTest } from "openclaw/plugin-sdk/agent-harness-runtime";
+import {
+  onInternalDiagnosticEvent,
+  resetDiagnosticEventsForTest,
+  type DiagnosticEventPayload,
+} from "openclaw/plugin-sdk/diagnostic-runtime";
 import {
   initializeGlobalHookRunner,
   resetGlobalHookRunner,
@@ -12,8 +17,10 @@ import { createMockPluginRegistry } from "openclaw/plugin-sdk/plugin-test-runtim
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CodexAppServerEventProjector,
+  type CodexAppServerEventProjectorOptions,
   type CodexAppServerToolTelemetry,
 } from "./event-projector.js";
+import { CodexNativeSubagentTaskMirror } from "./native-subagent-task-mirror.js";
 import { rememberCodexRateLimits, resetCodexRateLimitCacheForTests } from "./rate-limit-cache.js";
 import { createCodexTestModel } from "./test-support.js";
 
@@ -22,6 +29,10 @@ const TURN_ID = "turn-1";
 const tempDirs = new Set<string>();
 
 type ProjectorNotification = Parameters<CodexAppServerEventProjector["handleNotification"]>[0];
+
+function flushDiagnosticEvents() {
+  return new Promise<void>((resolve) => setImmediate(resolve));
+}
 
 function assistantMessage(text: string, timestamp: number) {
   return {
@@ -63,9 +74,10 @@ async function createParams(): Promise<EmbeddedRunAttemptParams> {
 
 async function createProjector(
   params?: EmbeddedRunAttemptParams,
+  options?: CodexAppServerEventProjectorOptions,
 ): Promise<CodexAppServerEventProjector> {
   const resolvedParams = params ?? (await createParams());
-  return new CodexAppServerEventProjector(resolvedParams, THREAD_ID, TURN_ID);
+  return new CodexAppServerEventProjector(resolvedParams, THREAD_ID, TURN_ID, options);
 }
 
 async function createProjectorWithAssistantHooks() {
@@ -82,10 +94,12 @@ async function createProjectorWithAssistantHooks() {
 
 beforeEach(() => {
   resetAgentEventsForTest();
+  resetDiagnosticEventsForTest();
 });
 
 afterEach(async () => {
   resetAgentEventsForTest();
+  resetDiagnosticEventsForTest();
   resetGlobalHookRunner();
   resetCodexRateLimitCacheForTests();
   vi.restoreAllMocks();
@@ -293,6 +307,125 @@ describe("CodexAppServerEventProjector", () => {
     expect(result.replayMetadata.replaySafe).toBe(true);
   });
 
+  it("records canonical OpenAI Codex app-server turns with Codex local attribution", async () => {
+    const params = await createParams();
+    const projector = await createProjector({
+      ...params,
+      provider: "openai",
+      modelId: "gpt-5.5",
+      model: {
+        ...createCodexTestModel("openai"),
+        id: "gpt-5.5",
+        name: "gpt-5.5",
+        api: "openai-responses",
+      } as EmbeddedRunAttemptParams["model"],
+      runtimePlan: {
+        auth: {},
+        observability: {
+          resolvedRef: "openai/gpt-5.5",
+          provider: "openai",
+          modelId: "gpt-5.5",
+          harnessId: "codex",
+        },
+        prompt: {
+          resolveSystemPromptContribution: () => undefined,
+        },
+        tools: {
+          normalize: (tools: unknown[]) => tools,
+          logDiagnostics: () => undefined,
+        },
+      } as unknown as EmbeddedRunAttemptParams["runtimePlan"],
+    });
+
+    await projector.handleNotification(
+      turnCompleted([{ type: "agentMessage", id: "msg-1", text: "done" }]),
+    );
+
+    const result = projector.buildResult(buildEmptyToolTelemetry());
+
+    expect(result.lastAssistant?.provider).toBe("openai-codex");
+    expect(result.lastAssistant?.api).toBe("openai-codex-responses");
+    expect(result.lastAssistant?.model).toBe("gpt-5.5");
+  });
+
+  it("preserves OpenAI attribution for Codex app-server OpenAI API-key fallback profiles", async () => {
+    const params = await createParams();
+    const projector = await createProjector({
+      ...params,
+      provider: "openai",
+      authProfileId: "openai:work",
+      modelId: "gpt-5.5",
+      model: {
+        ...createCodexTestModel("openai"),
+        id: "gpt-5.5",
+        name: "gpt-5.5",
+        api: "openai-responses",
+      } as EmbeddedRunAttemptParams["model"],
+      runtimePlan: {
+        auth: {
+          providerForAuth: "openai",
+          authProfileProviderForAuth: "openai",
+          harnessAuthProvider: "openai-codex",
+          forwardedAuthProfileId: "openai:work",
+        },
+        observability: {
+          resolvedRef: "openai/gpt-5.5",
+          provider: "openai",
+          modelId: "gpt-5.5",
+          harnessId: "codex",
+        },
+        prompt: {
+          resolveSystemPromptContribution: () => undefined,
+        },
+        tools: {
+          normalize: (tools: unknown[]) => tools,
+          logDiagnostics: () => undefined,
+        },
+      } as unknown as EmbeddedRunAttemptParams["runtimePlan"],
+    });
+
+    await projector.handleNotification(
+      turnCompleted([{ type: "agentMessage", id: "msg-1", text: "done" }]),
+    );
+
+    const result = projector.buildResult(buildEmptyToolTelemetry());
+
+    expect(result.lastAssistant?.provider).toBe("openai");
+    expect(result.lastAssistant?.api).toBe("openai-responses");
+    expect(result.lastAssistant?.model).toBe("gpt-5.5");
+  });
+
+  it("preserves inbound sender metadata on the mirrored user prompt", async () => {
+    const params = await createParams();
+    const projector = await createProjector({
+      ...params,
+      messageChannel: "discord",
+      messageProvider: "discord-voice",
+      senderId: "user-123",
+      senderName: "Test User",
+      senderUsername: "testuser",
+      inputProvenance: {
+        kind: "external_user",
+        sourceChannel: "discord",
+      },
+    });
+
+    const result = projector.buildResult(buildEmptyToolTelemetry());
+
+    const userMessage = requireRecord(result.messagesSnapshot[0], "user message");
+    expect(userMessage.role).toBe("user");
+    expect(userMessage.content).toBe("hello");
+    expect(userMessage.sourceChannel).toBe("discord");
+    expect(userMessage.senderId).toBe("user-123");
+    expect(userMessage.senderName).toBe("Test User");
+    expect(userMessage.senderUsername).toBe("testuser");
+    expect(userMessage.senderLabel).toBe("Test User (user-123)");
+    expect(userMessage.provenance).toEqual({
+      kind: "external_user",
+      sourceChannel: "discord",
+    });
+  });
+
   it("does not treat cumulative-only token usage as fresh context usage", async () => {
     const projector = await createProjector();
 
@@ -390,6 +523,53 @@ describe("CodexAppServerEventProjector", () => {
     });
 
     expect(result.toolMediaUrls).toStrictEqual([]);
+  });
+
+  it("does not promote repeated tool progress text to the final assistant reply", async () => {
+    const onToolResult = vi.fn();
+    const projector = await createProjector({
+      ...(await createParams()),
+      verboseLevel: "on",
+      onToolResult,
+    });
+
+    await projector.handleNotification(
+      forCurrentTurn("item/started", {
+        item: {
+          type: "commandExecution",
+          id: "cmd-1",
+          command: "pnpm test extensions/codex",
+          cwd: "/workspace",
+          processId: null,
+          source: "agent",
+          status: "inProgress",
+          commandActions: [],
+          aggregatedOutput: null,
+          exitCode: null,
+          durationMs: null,
+        },
+      }),
+    );
+    const toolProgressText = (mockCallArg(onToolResult, 0, 0, "onToolResult") as { text?: string })
+      .text;
+    expect(toolProgressText).toBe("🛠️ `run tests (workspace)`");
+
+    await projector.handleNotification(
+      forCurrentTurn("rawResponseItem/completed", {
+        item: {
+          type: "message",
+          id: "raw-tool-progress",
+          role: "assistant",
+          content: [{ type: "output_text", text: toolProgressText }],
+        },
+      }),
+    );
+    await projector.handleNotification(turnCompleted());
+
+    const result = projector.buildResult(buildEmptyToolTelemetry());
+
+    expect(result.assistantTexts).toEqual([]);
+    expect(result.lastAssistant).toBeUndefined();
   });
 
   it("does not fail a completed reply after a retryable app-server error notification", async () => {
@@ -515,6 +695,33 @@ describe("CodexAppServerEventProjector", () => {
     expect(result.promptErrorSource).toBe("prompt");
   });
 
+  it("preserves Codex retry hints when failed turns omit structured reset details", async () => {
+    const projector = await createProjector();
+
+    await projector.handleNotification(
+      forCurrentTurn("turn/completed", {
+        turn: {
+          id: TURN_ID,
+          status: "failed",
+          error: {
+            message:
+              "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at May 11th, 2026 9:00 AM.",
+            codexErrorInfo: "usageLimitExceeded",
+            additionalDetails: null,
+          },
+          items: [],
+        },
+      }),
+    );
+
+    const result = projector.buildResult(buildEmptyToolTelemetry());
+
+    expect(result.promptError).toContain("You've reached your Codex subscription usage limit.");
+    expect(result.promptError).toContain("Codex says to try again at May 11th, 2026 9:00 AM.");
+    expect(result.promptError).not.toContain("Codex did not return a reset time");
+    expect(result.promptErrorSource).toBe("prompt");
+  });
+
   it("normalizes snake_case current token usage fields", async () => {
     const projector = await createProjector();
 
@@ -591,6 +798,99 @@ describe("CodexAppServerEventProjector", () => {
     expect(JSON.stringify(result.messagesSnapshot)).not.toContain("checking thread context");
   });
 
+  it("streams commentary agent messages as keyed progress events", async () => {
+    const onAgentEvent = vi.fn();
+    const onPartialReply = vi.fn();
+    const projector = await createProjector({
+      ...(await createParams()),
+      onAgentEvent,
+      onPartialReply,
+    });
+
+    await projector.handleNotification(
+      forCurrentTurn("item/started", {
+        item: {
+          type: "agentMessage",
+          id: "msg-commentary",
+          phase: "commentary",
+          text: "",
+        },
+      }),
+    );
+    await projector.handleNotification(agentMessageDelta("Checking", "msg-commentary"));
+    await projector.handleNotification(
+      agentMessageDelta(" the app-server stream", "msg-commentary"),
+    );
+    await projector.handleNotification(
+      turnCompleted([
+        {
+          type: "agentMessage",
+          id: "msg-commentary",
+          phase: "commentary",
+          text: "Checking the app-server stream",
+        },
+        {
+          type: "agentMessage",
+          id: "msg-final",
+          phase: "final_answer",
+          text: "final answer",
+        },
+      ]),
+    );
+
+    const progressEvents = onAgentEvent.mock.calls
+      .map((call) => call[0])
+      .filter((event) => event.stream === "item" && event.data.kind === "preamble");
+
+    expect(onPartialReply).not.toHaveBeenCalled();
+    expect(progressEvents.map((event) => event.data)).toEqual([
+      {
+        itemId: "msg-commentary",
+        kind: "preamble",
+        title: "Preamble",
+        phase: "update",
+        progressText: "Checking",
+        source: "codex-app-server",
+      },
+      {
+        itemId: "msg-commentary",
+        kind: "preamble",
+        title: "Preamble",
+        phase: "update",
+        progressText: "Checking the app-server stream",
+        source: "codex-app-server",
+      },
+    ]);
+
+    const result = projector.buildResult(buildEmptyToolTelemetry());
+    expect(result.assistantTexts).toEqual(["final answer"]);
+  });
+
+  it("does not resolve commentary-phase assistant text as the final reply", async () => {
+    const projector = await createProjector();
+
+    await projector.handleNotification(
+      turnCompleted([
+        {
+          type: "agentMessage",
+          id: "msg-final",
+          phase: "final_answer",
+          text: "final answer",
+        },
+        {
+          type: "agentMessage",
+          id: "msg-commentary",
+          phase: "commentary",
+          text: "I am checking one more thing.",
+        },
+      ]),
+    );
+
+    const result = projector.buildResult(buildEmptyToolTelemetry());
+
+    expect(result.assistantTexts).toEqual(["final answer"]);
+  });
+
   it("ignores notifications for other turns", async () => {
     const projector = await createProjector();
 
@@ -601,6 +901,36 @@ describe("CodexAppServerEventProjector", () => {
 
     const result = projector.buildResult(buildEmptyToolTelemetry());
     expect(result.assistantTexts).toStrictEqual([]);
+  });
+
+  it("mirrors native subagent notifications before current-turn filtering", async () => {
+    const projector = await createProjector({
+      ...(await createParams()),
+      sessionKey: "agent:main:main",
+    } as EmbeddedRunAttemptParams);
+    const mirrorSpy = vi.spyOn(CodexNativeSubagentTaskMirror.prototype, "handleNotification");
+    const notification = {
+      method: "item/completed",
+      params: {
+        threadId: THREAD_ID,
+        turnId: "child-turn",
+        item: {
+          type: "collabAgentToolCall",
+          tool: "spawnAgent",
+          senderThreadId: THREAD_ID,
+          receiverThreadIds: ["child-thread"],
+          agentsStates: {
+            "child-thread": { status: "completed", message: "done" },
+          },
+        },
+      },
+    } as ProjectorNotification;
+
+    await projector.handleNotification(notification);
+
+    expect(mirrorSpy).toHaveBeenCalledWith(notification);
+    const result = projector.buildResult(buildEmptyToolTelemetry());
+    expect(result.assistantTexts).toEqual([]);
   });
 
   it("ignores notifications that omit top-level thread and turn ids", async () => {
@@ -780,41 +1110,48 @@ describe("CodexAppServerEventProjector", () => {
   it("synthesizes normalized tool progress for Codex-native tool items", async () => {
     const onAgentEvent = vi.fn();
     const projector = await createProjector({ ...(await createParams()), onAgentEvent });
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribe = onInternalDiagnosticEvent((event) => diagnosticEvents.push(event));
 
-    await projector.handleNotification(
-      forCurrentTurn("item/started", {
-        item: {
-          type: "commandExecution",
-          id: "cmd-1",
-          command: "pnpm test extensions/codex",
-          cwd: "/workspace",
-          processId: null,
-          source: "agent",
-          status: "inProgress",
-          commandActions: [],
-          aggregatedOutput: null,
-          exitCode: null,
-          durationMs: null,
-        },
-      }),
-    );
-    await projector.handleNotification(
-      forCurrentTurn("item/completed", {
-        item: {
-          type: "commandExecution",
-          id: "cmd-1",
-          command: "pnpm test extensions/codex",
-          cwd: "/workspace",
-          processId: null,
-          source: "agent",
-          status: "completed",
-          commandActions: [],
-          aggregatedOutput: "ok",
-          exitCode: 0,
-          durationMs: 42,
-        },
-      }),
-    );
+    try {
+      await projector.handleNotification(
+        forCurrentTurn("item/started", {
+          item: {
+            type: "commandExecution",
+            id: "cmd-1",
+            command: "pnpm test extensions/codex",
+            cwd: "/workspace",
+            processId: null,
+            source: "agent",
+            status: "inProgress",
+            commandActions: [],
+            aggregatedOutput: null,
+            exitCode: null,
+            durationMs: null,
+          },
+        }),
+      );
+      await projector.handleNotification(
+        forCurrentTurn("item/completed", {
+          item: {
+            type: "commandExecution",
+            id: "cmd-1",
+            command: "pnpm test extensions/codex",
+            cwd: "/workspace",
+            processId: null,
+            source: "agent",
+            status: "completed",
+            commandActions: [],
+            aggregatedOutput: "ok",
+            exitCode: 0,
+            durationMs: 42,
+          },
+        }),
+      );
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribe();
+    }
 
     const itemStart = findAgentEvent(onAgentEvent, {
       stream: "item",
@@ -844,6 +1181,41 @@ describe("CodexAppServerEventProjector", () => {
     const toolResultPayload = requireRecord(toolResult.result, "tool result payload");
     expect(toolResultPayload.exitCode).toBe(0);
     expect(toolResultPayload.durationMs).toBe(42);
+    const toolDiagnosticEvents = diagnosticEvents.filter(
+      (
+        event,
+      ): event is Extract<
+        DiagnosticEventPayload,
+        {
+          type:
+            | "tool.execution.started"
+            | "tool.execution.completed"
+            | "tool.execution.error"
+            | "tool.execution.blocked";
+        }
+      > => event.type.startsWith("tool.execution."),
+    );
+    expect(
+      toolDiagnosticEvents.map((event) => ({
+        type: event.type,
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        durationMs: "durationMs" in event ? event.durationMs : undefined,
+      })),
+    ).toEqual([
+      {
+        type: "tool.execution.started",
+        toolName: "bash",
+        toolCallId: "cmd-1",
+        durationMs: undefined,
+      },
+      {
+        type: "tool.execution.completed",
+        toolName: "bash",
+        toolCallId: "cmd-1",
+        durationMs: 42,
+      },
+    ]);
     const result = projector.buildResult(buildEmptyToolTelemetry());
     expect(result.messagesSnapshot.map((message) => message.role)).toEqual([
       "user",
@@ -873,6 +1245,207 @@ describe("CodexAppServerEventProjector", () => {
     expect(toolResultContentItem.toolName).toBe("bash");
     expect(toolResultContentItem.toolCallId).toBe("cmd-1");
     expect(toolResultContentItem.content).toBe("ok");
+  });
+
+  it("orders declined native tool diagnostics after their start event", async () => {
+    const projector = await createProjector();
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribe = onInternalDiagnosticEvent((event) => diagnosticEvents.push(event));
+
+    try {
+      await projector.handleNotification(
+        forCurrentTurn("item/started", {
+          item: {
+            type: "commandExecution",
+            id: "cmd-declined",
+            command: "pnpm test extensions/codex",
+            cwd: "/workspace",
+            processId: null,
+            source: "agent",
+            status: "inProgress",
+            commandActions: [],
+            aggregatedOutput: null,
+            exitCode: null,
+            durationMs: null,
+          },
+        }),
+      );
+      await projector.handleNotification(
+        forCurrentTurn("item/completed", {
+          item: {
+            type: "commandExecution",
+            id: "cmd-declined",
+            command: "pnpm test extensions/codex",
+            cwd: "/workspace",
+            processId: null,
+            source: "agent",
+            status: "declined",
+            commandActions: [],
+            aggregatedOutput: null,
+            exitCode: null,
+            durationMs: 1,
+          },
+        }),
+      );
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribe();
+    }
+
+    const toolDiagnosticEvents = diagnosticEvents.filter(
+      (
+        event,
+      ): event is Extract<
+        DiagnosticEventPayload,
+        {
+          type:
+            | "tool.execution.started"
+            | "tool.execution.completed"
+            | "tool.execution.error"
+            | "tool.execution.blocked";
+        }
+      > => event.type.startsWith("tool.execution."),
+    );
+    expect(
+      toolDiagnosticEvents.map((event) => ({
+        type: event.type,
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+      })),
+    ).toEqual([
+      {
+        type: "tool.execution.started",
+        toolName: "bash",
+        toolCallId: "cmd-declined",
+      },
+      {
+        type: "tool.execution.blocked",
+        toolName: "bash",
+        toolCallId: "cmd-declined",
+      },
+    ]);
+  });
+
+  it("emits after_tool_call observations for Codex-native tool item completions", async () => {
+    const afterToolCall = vi.fn();
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "after_tool_call", handler: afterToolCall }]),
+    );
+    const projector = await createProjector({
+      ...(await createParams()),
+      agentId: "main",
+      sessionKey: "agent:main:session-1",
+    });
+
+    await projector.handleNotification(
+      forCurrentTurn("item/started", {
+        item: {
+          type: "commandExecution",
+          id: "cmd-observed",
+          command: "pnpm test extensions/codex",
+          cwd: "/workspace",
+          processId: null,
+          source: "agent",
+          status: "inProgress",
+          commandActions: [],
+          aggregatedOutput: null,
+          exitCode: null,
+          durationMs: null,
+        },
+      }),
+    );
+    await projector.handleNotification(
+      forCurrentTurn("item/completed", {
+        item: {
+          type: "commandExecution",
+          id: "cmd-observed",
+          command: "pnpm test extensions/codex",
+          cwd: "/workspace",
+          processId: null,
+          source: "agent",
+          status: "completed",
+          commandActions: [],
+          aggregatedOutput: "ok",
+          exitCode: 0,
+          durationMs: 42,
+        },
+      }),
+    );
+
+    await vi.waitFor(() => expect(afterToolCall).toHaveBeenCalledTimes(1));
+    const event = requireRecord(
+      mockCallArg(afterToolCall, 0, 0, "after_tool_call event"),
+      "after_tool_call event",
+    );
+    expect(event.toolName).toBe("bash");
+    expect(event.params).toEqual({ command: "pnpm test extensions/codex", cwd: "/workspace" });
+    expect(event.runId).toBe("run-1");
+    expect(event.toolCallId).toBe("cmd-observed");
+    expect(event.result).toEqual({ status: "completed", exitCode: 0, durationMs: 42 });
+    expect(event.durationMs).toBeGreaterThanOrEqual(42);
+    const context = requireRecord(
+      mockCallArg(afterToolCall, 0, 1, "after_tool_call context"),
+      "after_tool_call context",
+    );
+    expect(context.agentId).toBe("main");
+    expect(context.sessionId).toBe("session-1");
+    expect(context.sessionKey).toBe("agent:main:session-1");
+    expect(context.runId).toBe("run-1");
+    expect(context.toolName).toBe("bash");
+    expect(context.toolCallId).toBe("cmd-observed");
+  });
+
+  it("does not duplicate native items already covered by PostToolUse relay", async () => {
+    const afterToolCall = vi.fn();
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([{ hookName: "after_tool_call", handler: afterToolCall }]),
+    );
+    const projector = await createProjector(
+      { ...(await createParams()), sessionKey: "agent:main:session-1" },
+      { nativePostToolUseRelayEnabled: true },
+    );
+
+    await projector.handleNotification(
+      forCurrentTurn("item/completed", {
+        item: {
+          type: "commandExecution",
+          id: "cmd-relayed",
+          command: "pnpm test extensions/codex",
+          cwd: "/workspace",
+          processId: null,
+          source: "agent",
+          status: "completed",
+          commandActions: [],
+          aggregatedOutput: "ok",
+          exitCode: 0,
+          durationMs: 42,
+        },
+      }),
+    );
+    expect(afterToolCall).not.toHaveBeenCalled();
+
+    await projector.handleNotification(
+      forCurrentTurn("item/completed", {
+        item: {
+          type: "webSearch",
+          id: "search-observed",
+          query: "native tool observability",
+          status: "completed",
+          durationMs: 5,
+        },
+      }),
+    );
+
+    await vi.waitFor(() => expect(afterToolCall).toHaveBeenCalledTimes(1));
+    const event = requireRecord(
+      mockCallArg(afterToolCall, 0, 0, "after_tool_call event"),
+      "after_tool_call event",
+    );
+    expect(event.toolName).toBe("web_search");
+    expect(event.params).toEqual({ query: "native tool observability" });
+    expect(event.runId).toBe("run-1");
+    expect(event.toolCallId).toBe("search-observed");
+    expect(event.result).toEqual({ status: "completed" });
   });
 
   it("records dynamic OpenClaw tool calls in mirrored transcript snapshots", async () => {
@@ -1034,7 +1607,7 @@ describe("CodexAppServerEventProjector", () => {
 
     expect(onToolResult).toHaveBeenCalledTimes(1);
     expect(onToolResult).toHaveBeenCalledWith({
-      text: "🛠️ Bash: `run tests (in /workspace)`",
+      text: "🛠️ `run tests (workspace)`",
     });
   });
 
@@ -1066,7 +1639,7 @@ describe("CodexAppServerEventProjector", () => {
     );
 
     expect(onToolResult).toHaveBeenCalledWith({
-      text: "🛠️ Bash: `` run tests (in /workspace), `pnpm test extensions/codex` ``",
+      text: "🛠️ `` run tests (workspace), `pnpm test extensions/codex` ``",
     });
   });
 
@@ -1097,7 +1670,7 @@ describe("CodexAppServerEventProjector", () => {
       }),
     );
 
-    const text = onToolResult.mock.calls[0]?.[0]?.text;
+    const text = (mockCallArg(onToolResult, 0, 0, "onToolResult") as { text?: string }).text;
     expect(text).toContain("sk-123…ZZZZ");
     expect(text).not.toContain("sk-1234567890abcdefZZZZ");
   });
@@ -1229,7 +1802,10 @@ describe("CodexAppServerEventProjector", () => {
     );
 
     expect(onToolResult).toHaveBeenCalledTimes(21);
-    expect(onToolResult.mock.calls[19]?.[0]?.text).toContain("...(truncated)...");
+    const truncatedOutput = mockCallArg(onToolResult, 19, 0, "onToolResult") as {
+      text?: string;
+    };
+    expect(truncatedOutput.text).toContain("...(truncated)...");
     expect(JSON.stringify(onToolResult.mock.calls)).not.toContain(
       "final output should not duplicate",
     );

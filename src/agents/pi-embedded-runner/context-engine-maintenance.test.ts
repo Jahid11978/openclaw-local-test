@@ -70,6 +70,10 @@ function requireRecord(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function firstMaintainParams(maintain: { mock: { calls: unknown[][] } }): Record<string, unknown> {
+  return requireRecord(maintain.mock.calls[0]?.[0], "maintain params");
+}
+
 function expectRecordFields(record: Record<string, unknown>, expected: Record<string, unknown>) {
   for (const [key, value] of Object.entries(expected)) {
     expect(record[key]).toBe(value);
@@ -77,7 +81,7 @@ function expectRecordFields(record: Record<string, unknown>, expected: Record<st
 }
 
 function expectSystemEventContaining(sessionKey: string, text: string) {
-  expect(peekSystemEvents(sessionKey).some((event) => event.includes(text))).toBe(true);
+  expect(peekSystemEvents(sessionKey).join("\n")).toContain(text);
 }
 
 vi.mock("./context-engine-capabilities.js", () => ({
@@ -324,7 +328,7 @@ describe("runContextEngineMaintenance", () => {
       bytesFreed: 0,
       rewrittenEntries: 0,
     });
-    const maintainParams = requireRecord(maintain.mock.calls[0]?.[0], "maintain params");
+    const maintainParams = firstMaintainParams(maintain);
     expectRecordFields(maintainParams, {
       sessionId: "session-1",
       sessionKey: "agent:main:session-1",
@@ -507,7 +511,7 @@ describe("runContextEngineMaintenance", () => {
         }
         releaseForeground();
         await waitForAssertion(() => expect(maintain).toHaveBeenCalledTimes(1));
-        const maintainParams = requireRecord(maintain.mock.calls[0]?.[0], "maintain params");
+        const maintainParams = firstMaintainParams(maintain);
         expectRecordFields(maintainParams, {
           sessionId: "session-1",
           sessionKey,
@@ -641,12 +645,18 @@ describe("runContextEngineMaintenance", () => {
 
         const sessionKey = "agent:main:session-rerun";
         let releaseFirstMaintenance: (() => void) | undefined;
+        let releaseSecondMaintenance: (() => void) | undefined;
         let maintenanceCalls = 0;
         const maintain = vi.fn(async () => {
           maintenanceCalls += 1;
           if (maintenanceCalls === 1) {
             await new Promise<void>((resolve) => {
               releaseFirstMaintenance = resolve;
+            });
+          }
+          if (maintenanceCalls === 2) {
+            await new Promise<void>((resolve) => {
+              releaseSecondMaintenance = resolve;
             });
           }
           return {
@@ -670,6 +680,7 @@ describe("runContextEngineMaintenance", () => {
           compact: async () => ({ ok: true, compacted: false }),
           maintain,
         } as NonNullable<Parameters<typeof runContextEngineMaintenance>[0]["contextEngine"]>;
+        const deferredPromises: Promise<void>[] = [];
 
         await runContextEngineMaintenance({
           contextEngine: backgroundEngine,
@@ -677,6 +688,9 @@ describe("runContextEngineMaintenance", () => {
           sessionKey,
           sessionFile: "/tmp/session-rerun.jsonl",
           reason: "turn",
+          onDeferredMaintenance: (promise) => {
+            deferredPromises.push(promise);
+          },
         });
 
         await waitForAssertion(() => expect(maintain).toHaveBeenCalledTimes(1));
@@ -687,6 +701,14 @@ describe("runContextEngineMaintenance", () => {
           sessionKey,
           sessionFile: "/tmp/session-rerun.jsonl",
           reason: "turn",
+          onDeferredMaintenance: (promise) => {
+            deferredPromises.push(promise);
+          },
+        });
+        expect(deferredPromises).toHaveLength(2);
+        let secondDeferredSettled = false;
+        const secondDeferred = deferredPromises[1].then(() => {
+          secondDeferredSettled = true;
         });
 
         if (!releaseFirstMaintenance) {
@@ -694,6 +716,15 @@ describe("runContextEngineMaintenance", () => {
         }
         releaseFirstMaintenance();
         await waitForAssertion(() => expect(maintain).toHaveBeenCalledTimes(2));
+        await Promise.resolve();
+        expect(secondDeferredSettled).toBe(false);
+
+        if (!releaseSecondMaintenance) {
+          throw new Error("Expected second maintenance release callback to be initialized");
+        }
+        releaseSecondMaintenance();
+        await secondDeferred;
+        expect(secondDeferredSettled).toBe(true);
 
         const tasks = listTasksForOwnerKey(sessionKey).filter(
           (task) => task.taskKind === TURN_MAINTENANCE_TASK_KIND,
@@ -768,9 +799,11 @@ describe("runContextEngineMaintenance", () => {
           status: "cancelled",
           notifyPolicy: "silent",
         });
-        expect(tasks.map((task) => task.runId)).toContainEqual(
-          expect.stringMatching(/^turn-maint:/),
-        );
+        expect(
+          tasks.some(
+            (task) => typeof task.runId === "string" && task.runId.startsWith("turn-maint:"),
+          ),
+        ).toBe(true);
       } finally {
         vi.useRealTimers();
       }

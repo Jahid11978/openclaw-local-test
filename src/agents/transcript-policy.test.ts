@@ -346,21 +346,41 @@ describe("resolveTranscriptPolicy", () => {
     expect(policy.validateAnthropicTurns).toBe(true);
   });
 
-  it("strips historical reasoning for Gemma 4 on OpenAI-compatible providers", () => {
+  it("strips historical reasoning for strict OpenAI-compatible providers", () => {
     const policy = resolveTranscriptPolicy({
       provider: "custom-openai-proxy",
-      modelId: "google/gemma-4-26b-a4b-it",
+      modelId: "qwen3.6-27b",
       modelApi: "openai-completions",
     });
     expect(policy.dropReasoningFromHistory).toBe(true);
 
-    const gemma3Policy = resolveTranscriptPolicy({
+    const responsesPolicy = resolveTranscriptPolicy({
       provider: "custom-openai-proxy",
-      modelId: "google/gemma-3-27b-it",
-      modelApi: "openai-completions",
+      modelId: "qwen3.6-27b",
+      modelApi: "openai-responses",
     });
-    expect(gemma3Policy.dropReasoningFromHistory).toBe(false);
+    expect(responsesPolicy.dropReasoningFromHistory).toBe(false);
   });
+
+  it.each([
+    "kimi-for-coding",
+    "moonshotai/kimi-k2.6",
+    "kimi-k2-thinking",
+    "hf:moonshotai/kimi-k2-thinking",
+    "xiaomi/mimo-v2.6-pro",
+    "xiaomi/mimo-v2.6-pro:cloud",
+  ])(
+    "preserves historical reasoning for %s replay-required OpenAI-compatible models",
+    (modelId) => {
+      const policy = resolveTranscriptPolicy({
+        provider: "custom-openai-proxy",
+        modelId,
+        modelApi: "openai-completions",
+      });
+
+      expect(policy.dropReasoningFromHistory).toBe(false);
+    },
+  );
 
   it("falls back to unowned transport defaults when no owning plugin exists", () => {
     expectStrictOpenAiCompatibleReplayDefaults("custom-openai-proxy");

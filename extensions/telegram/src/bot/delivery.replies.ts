@@ -1,6 +1,6 @@
 import { type Bot, GrammyError, InputFile } from "grammy";
-import type { ReplyToMode } from "openclaw/plugin-sdk/config-types";
-import type { MarkdownTableMode } from "openclaw/plugin-sdk/config-types";
+import type { ReplyToMode } from "openclaw/plugin-sdk/config-contracts";
+import type { MarkdownTableMode } from "openclaw/plugin-sdk/config-contracts";
 import { fireAndForgetHook } from "openclaw/plugin-sdk/hook-runtime";
 import { createInternalHookEvent, triggerInternalHook } from "openclaw/plugin-sdk/hook-runtime";
 import {
@@ -10,6 +10,10 @@ import {
   toPluginMessageSentEvent,
 } from "openclaw/plugin-sdk/hook-runtime";
 import type { ReplyPayloadDelivery } from "openclaw/plugin-sdk/interactive-runtime";
+import {
+  normalizeMessagePresentation,
+  presentationToInteractiveReply,
+} from "openclaw/plugin-sdk/interactive-runtime";
 import {
   buildOutboundMediaLoadOptions,
   isGifMedia,
@@ -668,7 +672,7 @@ export function emitTelegramMessageSentHooks(params: EmitMessageSentHookParams):
 
 export async function deliverReplies(params: {
   replies: ReplyPayload[];
-  cfg?: import("openclaw/plugin-sdk/config-types").OpenClawConfig;
+  cfg?: import("openclaw/plugin-sdk/config-contracts").OpenClawConfig;
   chatId: string;
   accountId?: string;
   sessionKeyForInternalHooks?: string;
@@ -755,10 +759,15 @@ export async function deliverReplies(params: {
         ? [reply.mediaUrl]
         : [];
     const hasMedia = mediaList.length > 0;
+    const presentation = normalizeMessagePresentation(reply?.presentation);
+    const interactive =
+      reply?.interactive ??
+      (presentation ? presentationToInteractiveReply(presentation) : undefined);
     const resolvedReplyText =
       resolveTelegramInteractiveTextFallback({
         text: reply?.text,
-        interactive: reply?.interactive,
+        interactive,
+        presentation,
       }) ??
       reply?.text ??
       "";
@@ -820,7 +829,7 @@ export async function deliverReplies(params: {
       const replyMarkup = buildInlineKeyboard(
         resolveTelegramInlineButtons({
           buttons: telegramData?.buttons,
-          interactive: reply.interactive,
+          interactive,
         }),
       );
       let firstDeliveredMessageId: number | undefined;

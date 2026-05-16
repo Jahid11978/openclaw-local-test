@@ -5,13 +5,13 @@ import {
   type ChatCommandDefinition,
   type CommandArgs,
 } from "openclaw/plugin-sdk/command-auth-native";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { ResolvedAgentRoute } from "openclaw/plugin-sdk/routing";
 import { loadSessionStore, resolveStorePath } from "openclaw/plugin-sdk/session-store-runtime";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
-} from "openclaw/plugin-sdk/text-runtime";
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   Container,
   TextDisplay,
@@ -83,12 +83,6 @@ function buildDiscordModelPickerCurrentModel(
   defaultModel: string,
 ): string {
   return `${defaultProvider}/${defaultModel}`;
-}
-
-function resolveConfiguredAgentRuntimeId(value: {
-  agentRuntime?: { id?: unknown };
-}): string | undefined {
-  return normalizeOptionalString(value.agentRuntime?.id);
 }
 
 export function buildDiscordModelPickerAllowedModelRefs(
@@ -277,19 +271,9 @@ export function resolveDiscordModelPickerCurrentRuntime(params: {
     if (sessionRuntime) {
       return sessionRuntime;
     }
-  } catch {
-    // Fall through to configured defaults when the session store is unavailable.
-  }
+  } catch {}
 
-  const agentRuntime = resolveConfiguredAgentRuntimeId(
-    params.cfg.agents?.list?.find(
-      (entry) => normalizeOptionalString(entry.id) === params.route.agentId,
-    ) ?? {},
-  );
-  if (agentRuntime) {
-    return agentRuntime;
-  }
-  return resolveConfiguredAgentRuntimeId(params.cfg.agents?.defaults ?? {}) ?? "auto";
+  return "auto";
 }
 
 export async function replyWithDiscordModelPickerProviders(params: {

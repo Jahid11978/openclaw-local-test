@@ -105,6 +105,29 @@ function emptyPluginMetadataSnapshot() {
   };
 }
 
+function modelIdNormalizationSnapshot() {
+  return {
+    ...emptyPluginMetadataSnapshot(),
+    configFingerprint: "model-id-normalizers",
+    plugins: [
+      {
+        id: "external-normalizer",
+        modelIdNormalization: {
+          providers: {
+            custom: {
+              aliases: {
+                latest: "modern-model",
+              },
+              stripPrefixes: ["legacy/"],
+              prefixWhenBare: "vendor",
+            },
+          },
+        },
+      },
+    ],
+  };
+}
+
 type ModelCatalogEntry = Awaited<
   ReturnType<typeof import("./model-catalog.js").loadModelCatalog>
 >[number];
@@ -235,19 +258,43 @@ describe("loadModelCatalog", () => {
     mockPiDiscoveryModels(models);
 
     const first = await loadModelCatalog({ config: {} as OpenClawConfig });
-    expect(first).toContainEqual({ id: "existing", name: "Existing", provider: "ollama" });
+    expect(first).toStrictEqual([
+      {
+        id: "existing",
+        name: "Existing",
+        provider: "ollama",
+        contextWindow: undefined,
+        reasoning: undefined,
+        input: undefined,
+        compat: undefined,
+      },
+    ]);
 
     models.push({ id: "glm-5.1:cloud", name: "GLM 5.1 Cloud", provider: "ollama" });
     resetModelCatalogCacheForTest();
     mockPiDiscoveryModels(models);
 
     const second = await loadModelCatalog({ config: {} as OpenClawConfig });
-    expect(second).toContainEqual({ id: "existing", name: "Existing", provider: "ollama" });
-    expect(second).toContainEqual({
-      id: "glm-5.1:cloud",
-      name: "GLM 5.1 Cloud",
-      provider: "ollama",
-    });
+    expect(second).toStrictEqual([
+      {
+        id: "existing",
+        name: "Existing",
+        provider: "ollama",
+        contextWindow: undefined,
+        reasoning: undefined,
+        input: undefined,
+        compat: undefined,
+      },
+      {
+        id: "glm-5.1:cloud",
+        name: "GLM 5.1 Cloud",
+        provider: "ollama",
+        contextWindow: undefined,
+        reasoning: undefined,
+        input: undefined,
+        compat: undefined,
+      },
+    ]);
   });
 
   it("returns partial results on discovery errors", async () => {
@@ -461,6 +508,52 @@ describe("loadModelCatalog", () => {
     ]);
     expect(ensureOpenClawModelsJsonMock).not.toHaveBeenCalled();
     expect(augmentCatalogMock).not.toHaveBeenCalled();
+  });
+
+  it("normalizes persisted read-only catalog rows with manifest model id policies", async () => {
+    currentPluginMetadataSnapshotMock.mockReturnValueOnce(modelIdNormalizationSnapshot());
+    readFileMock.mockResolvedValueOnce(
+      JSON.stringify({
+        providers: {
+          custom: {
+            models: [
+              { id: "latest", name: "Latest Alias" },
+              { id: "legacy/trimmed" },
+              { id: "vendor/already-prefixed" },
+            ],
+          },
+        },
+      }),
+    );
+
+    const result = await loadModelCatalog({ config: {} as OpenClawConfig, readOnly: true });
+
+    expect(requireCatalogEntry(result, "custom", "vendor/modern-model").name).toBe("Latest Alias");
+    expect(requireCatalogEntry(result, "custom", "vendor/trimmed").name).toBe("vendor/trimmed");
+    expect(requireCatalogEntry(result, "custom", "vendor/already-prefixed").name).toBe(
+      "vendor/already-prefixed",
+    );
+    expect(loadPluginMetadataSnapshotMock).not.toHaveBeenCalled();
+  });
+
+  it("loads manifest model id policies once for persisted read-only catalog rows", async () => {
+    currentPluginMetadataSnapshotMock.mockReturnValue(undefined);
+    loadPluginMetadataSnapshotMock.mockReturnValue(modelIdNormalizationSnapshot());
+    readFileMock.mockResolvedValueOnce(
+      JSON.stringify({
+        providers: {
+          custom: {
+            models: [{ id: "model-a" }, { id: "model-b" }, { id: "model-c" }, { id: "model-d" }],
+          },
+        },
+      }),
+    );
+
+    const result = await loadModelCatalog({ config: {} as OpenClawConfig, readOnly: true });
+
+    expect(requireCatalogEntry(result, "custom", "vendor/model-a").name).toBe("vendor/model-a");
+    expect(requireCatalogEntry(result, "custom", "vendor/model-d").name).toBe("vendor/model-d");
+    expect(loadPluginMetadataSnapshotMock).toHaveBeenCalledTimes(1);
   });
 
   it("preserves provider context defaults for persisted read-only catalog rows", async () => {
